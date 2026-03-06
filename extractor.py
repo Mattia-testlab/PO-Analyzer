@@ -34,6 +34,7 @@ logger = logging.getLogger("po_extract")
 COLUMNS = [
     "nome_file",
     "PO",
+    "tipo_ordine",
     "QVC",
     "MODVR",
     "modello",
@@ -50,36 +51,104 @@ COLUMNS = [
 
 # ── Regex patterns (derived from real PDF output) ───────────────────────────
 
-# First line of an item block:
-#   154957 ONJ W40 Motivi PANTALONE PALAZZO CON CINTUR 02.03.26 20 34,16 683,20
-# OR (no space before description, seen on page 3):
-#   154958 QPW MMotivi MAGLIA KIMONETTA cacao M 02.03.26 15 15,16 227,40
+# Two-step approach for item lines:
+# Step 1: Match the overall structure:  6-digit + middle + date + qty + price + value
+# Step 2: Post-process 'middle' to separate QVC code from description.
 #
-# QVC = 6-digit code + space + alphanumeric variant + space + size (or color-size)
-# We capture the QVC part, the description, date, qty, unit price, net value.
-# Pattern matches lines like:
+# Examples of item lines:
 #   154957 ONJ W40 Motivi PANTALONE PALAZZO CON CINTUR 02.03.26 20 34,16 683,20
-#   154958 QPW MMotivi MAGLIA KIMONETTA cacao M 02.03.26 15 15,16 227,40
-# The QVC code is: 6 digits + variant + size.  The size might run into the
-# description when the PDF has no space ("QPW MMotivi").
+#   154890 AJG W42 oltre TRENCH CORTO IN FINTA PELLE 02.03.26 30 52,00 1.560,00
+#   154951 QPW W40Motivi GIUBBINO IN ECOPELLE 02.03.26 10 35,00 350,00
+#   154887 AAA XLoltre T-shirt bimaterica 02.03.26 29 12,50 362,50
+#   154892 AAP XLOltre Cardigan lungo 02.03.26 9 37,96 341,64
+
 RE_ITEM_LINE = re.compile(
-    r"^(\d{6}\s+\S+\s+\S+?)"      # QVC code — non-greedy last token
-    r"\s*"                          # optional space (sometimes missing!)
-    r"([A-Z][a-z].+?)"             # description starts with a Capital letter
+    r"^(\d{6})"                      # 6-digit article code
     r"\s+"
-    r"(\d{2}\.\d{2}\.\d{2})"       # date DD.MM.YY
+    r"(.+?)"                          # middle: variant + size + description
     r"\s+"
-    r"(\d[\d.]*)"                   # quantity
+    r"(\d{2}\.\d{2}\.\d{2})"         # date DD.MM.YY
     r"\s+"
-    r"([\d.,]+)"                    # unit price
+    r"(\d[\d.]*)"                     # quantity
     r"\s+"
-    r"([\d.,]+)"                    # net value
+    r"([\d.,]+)"                      # unit price
+    r"\s+"
+    r"([\d.,]+)"                      # net value
     r"\s*$"
 )
+
+# Known size tokens (order matters: longer patterns first)
+_SIZE_TOKENS = [
+    "NOSIZE", "XL", "XS", "XXL", "XXS",
+    "W36", "W38", "W40", "W42", "W44", "W46", "W48", "W50", "W52",
+    "S", "M", "L", "X",
+]
+# Known brand prefixes that mark the start of the description when glued
+_BRAND_PREFIXES = ["Motivi", "Oltre", "oltre", "olte", "Fiorella", "fiorella"]
+
+# Regex to split: variant (2-3 alpha) + size (possibly glued to description)
+_RE_VARIANT_SIZE = re.compile(
+    r"^([A-Z]{2,4})"                # variant code (e.g., ONJ, AJG, QPW, AAA)
+    r"\s+"
+    r"(\S+)"                         # size token (may be glued to description)
+    r"(?:\s+(.*))?$"                 # rest = description (may be absent if glued)
+)
+
+
+def _split_qvc_description(article_code: str, middle: str) -> tuple[str, str, str]:
+    """Split the middle part of an item line into (qvc, taglia, descrizione).
+
+    Returns (qvc_code, taglia, descrizione).
+    The qvc_code includes the 6-digit article code, variant, and size.
+    """
+    m = _RE_VARIANT_SIZE.match(middle)
+    if not m:
+        # Fallback: return article_code as QVC, no taglia, rest as description
+        return article_code, "", middle.strip()
+
+    variant = m.group(1)          # e.g., "ONJ", "AJG"
+    size_raw = m.group(2)         # e.g., "W40", "W40Motivi", "XLoltre", "QKU"
+    rest = (m.group(3) or "").strip()  # description after space (may be empty)
+
+    # Check if size_raw contains a glued brand/description
+    taglia = size_raw
+    glued_desc = ""
+
+    # First check: is size_raw an exact known token? (e.g., "XS", "W40", "M")
+    if size_raw in _SIZE_TOKENS or re.match(r'^[A-Z]\d+$', size_raw):
+        taglia = size_raw
+    else:
+        # Try splitting known size tokens from the start of size_raw
+        for st in _SIZE_TOKENS:
+            if size_raw.startswith(st) and len(size_raw) > len(st):
+                taglia = st
+                glued_desc = size_raw[len(st):]
+                break
+        else:
+            # No known size prefix found
+            if re.match(r'^(W\d+|QKU)', size_raw):
+                # Size pattern like W40, QKU followed by text
+                sm = re.match(r'^(W\d+|QKU)(.*)', size_raw)
+                if sm:
+                    taglia = sm.group(1)
+                    glued_desc = sm.group(2)
+
+    # Build description from glued part + rest
+    if glued_desc and rest:
+        descrizione = glued_desc + " " + rest
+    elif glued_desc:
+        descrizione = glued_desc
+    else:
+        descrizione = rest
+
+    qvc = f"{article_code} {variant} {taglia}"
+    return qvc, taglia, descrizione.strip()
+
 
 RE_COD_ART_FORN = re.compile(r"Cod\.art\.forn\.\s*:\s*(\S+)", re.IGNORECASE)
 RE_PAESE = re.compile(r"Paese di origine\s*:\s*(.+)", re.IGNORECASE)
 RE_PO_HEADER = re.compile(r"^\s*(\d{10})\s*$")
+RE_TIPO_ORDINE = re.compile(r"Tipo Ordine:\s*(.+?)\s+Termini", re.IGNORECASE)
 
 
 # ── Engine: pdfplumber + regex ──────────────────────────────────────────────
@@ -92,6 +161,7 @@ def extract_with_pdfplumber_regex(pdf_path: str | Path) -> pd.DataFrame:
     pdf_path = Path(pdf_path)
     filename = pdf_path.name
     po_number = extract_po_from_filename(filename)
+    tipo_ordine = ""
 
     records: list[dict] = []
 
@@ -111,22 +181,31 @@ def extract_with_pdfplumber_regex(pdf_path: str | Path) -> pd.DataFrame:
                         po_number = m.group(1)
                         break
 
+            # Extract Tipo Ordine from first page only
+            if page_num == 1 and not tipo_ordine:
+                for line in lines:
+                    tm = RE_TIPO_ORDINE.search(line)
+                    if tm:
+                        tipo_ordine = tm.group(1).strip()
+                        break
+
             # Parse item blocks
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
                 m = RE_ITEM_LINE.match(line)
                 if m:
-                    qvc = m.group(1).strip()
-                    descrizione = m.group(2).strip()
+                    article_code = m.group(1).strip()
+                    middle = m.group(2).strip()
                     data_consegna = m.group(3).strip()
                     quantita = m.group(4).strip()
                     prezzo_unitario = m.group(5).strip()
                     valore_netto = m.group(6).strip()
 
-                    # Extract taglia (size) = last token of QVC code
-                    qvc_parts = qvc.split()
-                    taglia = qvc_parts[-1] if len(qvc_parts) >= 3 else ""
+                    # Split middle into QVC code, taglia, and description
+                    qvc, taglia, descrizione = _split_qvc_description(
+                        article_code, middle
+                    )
 
                     # Scan continuation lines for Cod.art.forn and Paese
                     modvr = ""
@@ -214,6 +293,7 @@ def extract_with_pdfplumber_regex(pdf_path: str | Path) -> pd.DataFrame:
                     records.append({
                         "nome_file": filename,
                         "PO": po_number,
+                        "tipo_ordine": tipo_ordine,
                         "QVC": qvc,
                         "MODVR": modvr,
                         "modello": modello,
@@ -267,6 +347,7 @@ def extract_with_pdfplumber(pdf_path: str | Path) -> pd.DataFrame:
             records.append({
                 "nome_file": filename,
                 "PO": po_number,
+                "tipo_ordine": "",
                 "QVC": str(row[0] or "").strip(),
                 "MODVR": "",
                 "modello": "",
@@ -308,6 +389,7 @@ def extract_with_camelot(pdf_path: str | Path) -> pd.DataFrame:
                         records.append({
                             "nome_file": filename,
                             "PO": po_number,
+                            "tipo_ordine": "",
                             "QVC": str(vals[0]).strip(),
                             "MODVR": "",
                             "modello": "",
