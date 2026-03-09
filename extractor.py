@@ -79,7 +79,7 @@ RE_ITEM_LINE = re.compile(
 
 # Known size tokens (order matters: longer patterns first)
 _SIZE_TOKENS = [
-    "NOSIZE", "XL", "XS", "XXL", "XXS",
+    "NOSIZE", "OVR", "OVQ", "XL", "XS", "XXL", "XXS",
     "W36", "W38", "W40", "W42", "W44", "W46", "W48", "W50", "W52",
     "S", "M", "L", "X",
 ]
@@ -141,8 +141,16 @@ def _split_qvc_description(article_code: str, middle: str) -> tuple[str, str, st
     else:
         descrizione = rest
 
+    descrizione = descrizione.strip()
+    
+    # Clean up trailing boilerplate. Some PDF layouts glue the next item's article_code prefix 
+    # to the end of the current description. e.g. "TOP LINGERIE naturale XL 154908:"
+    trailing_boiler = f"{article_code}:"
+    if descrizione.endswith(trailing_boiler):
+        descrizione = descrizione[:-len(trailing_boiler)].strip()
+
     qvc = f"{article_code} {variant} {taglia}"
-    return qvc, taglia, descrizione.strip()
+    return qvc, taglia, descrizione
 
 
 RE_COD_ART_FORN = re.compile(r"Cod\.art\.forn\.\s*:\s*(\S+)", re.IGNORECASE)
